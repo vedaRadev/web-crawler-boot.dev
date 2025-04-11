@@ -8,6 +8,7 @@ import (
 	neturl "net/url"
 	nethtml "golang.org/x/net/html"
 	"strings"
+	"time"
 )
 
 func normalizeURL(url string) (string, error) {
@@ -68,6 +69,42 @@ func getHTML(rawURL string) (string, error) {
 	return string(html), nil
 }
 
+type SimpleQueueNode[T any] struct {
+	val T
+	next *SimpleQueueNode[T]
+}
+
+type SimpleQueue[T any] struct {
+	front *SimpleQueueNode[T]
+	back *SimpleQueueNode[T]
+}
+
+// Add to back
+func (q *SimpleQueue[T]) Add(val T) {
+	node := SimpleQueueNode[T] { val: val }
+	if q.front == nil {
+		q.front = &node
+		q.back = &node
+	} else {
+		q.back.next = &node
+		q.back = &node
+	}
+}
+
+// Pop from front
+func (q *SimpleQueue[T]) Pop() (T, bool) {
+	var result T
+	if q.front == nil { return result, false }
+	node := q.front
+	q.front = q.front.next
+	if q.front == nil { q.back = nil }
+	return node.val, true
+}
+
+func (q *SimpleQueue[T]) IsEmpty() bool {
+	return q.front == nil
+}
+
 func main() {
 	args := os.Args[1:]
 	if len(args) == 0 {
@@ -80,11 +117,56 @@ func main() {
 	}
 
 	baseURL := args[0]
-	fmt.Printf("starting crawl of: %v\n", baseURL)
-	html, err := getHTML(baseURL)
+	normalizedBase, err := normalizeURL(baseURL)
 	if err != nil {
-		fmt.Printf("failed to get html: %v\n", err)
-	} else {
-		fmt.Println(html)
+		fmt.Printf("failed to normalize %v: %v\n", baseURL, err)
+		os.Exit(1)
 	}
+
+	pagesVisited := map[string]int{}
+	visitQueue := SimpleQueue[string]{}
+	visitQueue.Add(baseURL)
+	for !visitQueue.IsEmpty() {
+		urlToCrawl, _ := visitQueue.Pop()
+		if !strings.Contains(urlToCrawl, normalizedBase) {
+			continue
+		}
+		fmt.Println()
+		fmt.Printf("visiting: %v\n", urlToCrawl)
+		normalizedUrl, err := normalizeURL(urlToCrawl)
+		if err != nil {
+			fmt.Printf("failed to normalize %v: %v\n", urlToCrawl, err)
+			continue
+		}
+		fmt.Printf("normalized: %v\n", normalizedUrl)
+		if _, exists := pagesVisited[normalizedUrl]; exists {
+			pagesVisited[normalizedUrl] += 1
+			continue // no need to fetch and crawl again
+		} else {
+			pagesVisited[normalizedUrl] = 1
+		}
+
+		fmt.Printf("fetching HTML for: %v\n", urlToCrawl)
+		time.Sleep(100 * time.Millisecond)
+		html, err := getHTML(urlToCrawl)
+		if err != nil {
+			fmt.Printf("failed to fetch HTML for %v: %v\n", urlToCrawl, err)
+			continue
+		}
+
+		fmt.Printf("starting crawl of: %v\n", urlToCrawl)
+		discovered, err := getURLsFromHTML(html, urlToCrawl)
+		if err != nil {
+			fmt.Printf("failed to crawl %v: %v\n", urlToCrawl, err)
+			continue
+		}
+
+		fmt.Println("DISCOVERED:")
+		for _, discoveredUrl := range discovered {
+			fmt.Printf("\t%v\n", discoveredUrl)
+			visitQueue.Add(discoveredUrl)
+		}
+	}
+
+	fmt.Println(pagesVisited)
 }
