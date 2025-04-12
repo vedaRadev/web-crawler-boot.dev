@@ -135,6 +135,8 @@ func main() {
 			if pagesCrawled >= MAX_PAGES { break }
 
 			// crawl the page
+			// TODO limit the number of goroutines we can spawn here.
+			// Maybe have a goroutine pool or something.
 			go crawlPage(url, discoveredUrls)
 		}
 
