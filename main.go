@@ -9,6 +9,9 @@ import (
 	nethtml "golang.org/x/net/html"
 	"strings"
 	"sync"
+	semaphore "golang.org/x/sync/semaphore"
+	"context"
+	"strconv"
 )
 
 func normalizeURL(url string) (string, error) {
@@ -35,7 +38,11 @@ func getURLsFromHTML(htmlBody, rawBaseURL string) ([]string, error) {
 			for _, attr := range node.Attr {
 				if attr.Key == "href" && len(attr.Val) > 0 {
 					if attr.Val[0] == '/' {
-						result = append(result, rawBaseURL + attr.Val)
+						if rawBaseURL[len(rawBaseURL) - 1] == '/' {
+							result = append(result, rawBaseURL + attr.Val[1:])
+						} else {
+							result = append(result, rawBaseURL + attr.Val)
+						}
 					} else {
 						result = append(result, attr.Val)
 					}
@@ -69,53 +76,70 @@ func getHTML(rawURL string) (string, error) {
 	return string(html), nil
 }
 
-func crawlPage(urlToCrawl string, discoveredUrls chan <-string) {
+func crawlPage(base, urlToCrawl string, discoveredUrls chan <-string, sem *semaphore.Weighted) {
+	defer sem.Release(1)
+	defer fmt.Printf("%v - releasing semaphore\n", urlToCrawl)
+
+	fmt.Printf("%v: fetching html\n", urlToCrawl)
 	html, err := getHTML(urlToCrawl)
 	if err != nil {
-		fmt.Printf("failed to fetch HTML for %v: %v\n", urlToCrawl, err)
+		fmt.Printf("%v: failed to fetch HTML - %v\n", urlToCrawl, err)
 		return
 	}
 
-	fmt.Printf("starting crawl of: %v\n", urlToCrawl)
+	fmt.Printf("%v: starting crawl\n", urlToCrawl)
 	discovered, err := getURLsFromHTML(html, urlToCrawl)
 	if err != nil {
 		fmt.Printf("failed to crawl %v: %v\n", urlToCrawl, err)
 		return
 	}
 
-	for _, discoveredUrl := range discovered {
-		discoveredUrls <- discoveredUrl
+	fmt.Printf("%v: crawl done, found %v urls\n", urlToCrawl, len(discovered))
+	for i, discoveredUrl := range discovered {
+		// Limit crawl to a single domain
+		if strings.Contains(discoveredUrl, base) {
+			fmt.Printf("\t%v: %v - SEND %v\n", i, urlToCrawl, discoveredUrl)
+			discoveredUrls <- discoveredUrl
+		} else {
+			fmt.Printf("\t%v: %v - DISCARD %v\n", i, urlToCrawl, discoveredUrl)
+		}
 	}
 }
 
 func main() {
 	args := os.Args[1:]
-	if len(args) == 0 {
-		fmt.Println("no website provided")
-		os.Exit(1)
-	}
-	if len(args) > 1 {
-		fmt.Println("too many arguments provided")
+	if len(args) != 2 {
+		fmt.Println("usage: ./crawler URL MAX_CONCURRENCY")
 		os.Exit(1)
 	}
 
 	baseURL := args[0]
+	maxConcurrency, err := strconv.Atoi(args[1])
+	if err != nil {
+		fmt.Println("MAX_CONCURRENCY must be an integer")
+		os.Exit(1)
+	}
+
 	normalizedBase, err := normalizeURL(baseURL)
 	if err != nil {
 		fmt.Printf("failed to normalize %v: %v\n", baseURL, err)
 		os.Exit(1)
 	}
 
-	discoveredUrls := make(chan string)
+	// FIXME this could potentially fill up and our crawlers won't be able to send any more
+	// messages, meaning either data will be dropped or the crawler will block and won't
+	// release its semaphore, ensuring program deadlock. Can mitigate this by switching to a
+	// recursive crawl model.
+	discoveredUrls := make(chan string, 8192)
 	var wg sync.WaitGroup
+	wg.Add(1)
+	availableWorkers := semaphore.NewWeighted(int64(maxConcurrency))
+	ctx := context.TODO()
 	go (func() {
-		wg.Add(1)
 		pagesVisited := map[string]int{}
 		const MAX_PAGES int = 20
 		pagesCrawled := 0
 		for url := range discoveredUrls {
-			// Limit our crawl to a single domain
-			if !strings.Contains(url, normalizedBase) { continue; }
 			fmt.Println()
 			fmt.Printf("visiting: %v\n", url)
 			normalizedUrl, err := normalizeURL(url)
@@ -134,10 +158,15 @@ func main() {
 			pagesCrawled += 1
 			if pagesCrawled >= MAX_PAGES { break }
 
-			// crawl the page
-			// TODO limit the number of goroutines we can spawn here.
-			// Maybe have a goroutine pool or something.
-			go crawlPage(url, discoveredUrls)
+			fmt.Printf("acquiring goroutine for crawl of %v\n", url)
+			err = availableWorkers.Acquire(ctx, 1)
+			if err != nil {
+				fmt.Printf("failed to acquire goroutine for %v: %v\n", url, err)
+				os.Exit(1)
+			}
+
+			fmt.Printf("ACQUIRED for %v\n", url)
+			go crawlPage(normalizedBase, url, discoveredUrls, availableWorkers)
 		}
 
 		fmt.Println("closing channel")
@@ -151,4 +180,5 @@ func main() {
 
 	discoveredUrls <- baseURL
 	wg.Wait()
+	fmt.Println("end")
 }
