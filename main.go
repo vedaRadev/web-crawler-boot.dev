@@ -12,6 +12,8 @@ import (
 	semaphore "golang.org/x/sync/semaphore"
 	"context"
 	"strconv"
+	"slices"
+	"time"
 )
 
 func normalizeURL(url string) (string, error) {
@@ -20,8 +22,14 @@ func normalizeURL(url string) (string, error) {
 	return strings.TrimRight(parsed.Host + parsed.Path, "/"), nil
 }
 
-func getURLsFromHTML(htmlBody, rawBaseURL string) ([]string, error) {
+func getURLsFromHTML(htmlBody string, rawBaseURL string) ([]string, error) {
 	var result []string
+
+	baseURL, err := neturl.Parse(rawBaseURL)
+	if err != nil {
+		fmt.Printf("failed to parse base url %v\n", rawBaseURL)
+		return result, err
+	}
 
 	htmlReader := strings.NewReader(htmlBody)
 	htmlRoot, err := nethtml.Parse(htmlReader)
@@ -37,15 +45,10 @@ func getURLsFromHTML(htmlBody, rawBaseURL string) ([]string, error) {
 		if node.Type == nethtml.ElementNode && node.Data == "a" {
 			for _, attr := range node.Attr {
 				if attr.Key == "href" && len(attr.Val) > 0 {
-					if attr.Val[0] == '/' {
-						if rawBaseURL[len(rawBaseURL) - 1] == '/' {
-							result = append(result, rawBaseURL + attr.Val[1:])
-						} else {
-							result = append(result, rawBaseURL + attr.Val)
-						}
-					} else {
-						result = append(result, attr.Val)
-					}
+					href, err := neturl.Parse(attr.Val)
+					if err != nil { continue }
+					resolvedURL := baseURL.ResolveReference(href)
+					result = append(result, resolvedURL.String())
 				}
 			}
 		}
@@ -60,7 +63,13 @@ func getURLsFromHTML(htmlBody, rawBaseURL string) ([]string, error) {
 }
 
 func getHTML(rawURL string) (string, error) {
-	resp, err := http.Get(rawURL)
+	ctx, cancel := context.WithTimeout(context.Background(), 1500 * time.Millisecond)
+	defer cancel()
+
+	req, err := http.NewRequestWithContext(ctx, "GET", rawURL, nil)
+	if err != nil { return "", err }
+
+	resp, err := http.DefaultClient.Do(req)
 	if err != nil { return "", err }
 	if resp.StatusCode >= 400 && resp.StatusCode <= 499 {
 		return "", fmt.Errorf("400 status: %v", resp.StatusCode)
@@ -193,8 +202,17 @@ func main() {
 
 	wg.Wait()
 
+	type kv struct { k string; v int }
+	var kvPairs []kv
+	for url, count := range urlsFound {
+		kvPairs = append(kvPairs, kv { k: url, v: count })
+	}
+	slices.SortFunc(kvPairs, func(a, b kv) int { return b.v - a.v })
+
+	fmt.Println()
+	fmt.Printf("REPORT for %v\n", baseURL)
 	fmt.Printf("crawled %v pages\n", numPagesCrawled)
-	for k, v := range urlsFound {
-		fmt.Printf("\t%v - %v\n", k, v)
+	for _, entry := range kvPairs {
+		fmt.Printf("\tFound %v internal links to %v\n", entry.v, entry.k)
 	}
 }
