@@ -76,9 +76,53 @@ func getHTML(rawURL string) (string, error) {
 	return string(html), nil
 }
 
-func crawlPage(base, urlToCrawl string, discoveredUrls chan <-string, sem *semaphore.Weighted) {
+// TODO instead of a sempahore use a buffered channel for concurrency control
+func crawlPage(
+	base *string,
+	urlToCrawl string,
+	pagesVisited map[string]int,
+	pagesCrawled *int,
+	MAX_PAGES int,
+	mu *sync.Mutex,
+	sem *semaphore.Weighted,
+	sem_ctx context.Context,
+	wg *sync.WaitGroup,
+) {
+	// this should've been incremented BEFORE entering the function
+	defer wg.Done()
+
+	err := sem.Acquire(sem_ctx, 1)
+	if err != nil {
+		fmt.Printf("%v - failed to acquire semaphore\n", urlToCrawl)
+		return
+	}
 	defer sem.Release(1)
-	defer fmt.Printf("%v - releasing semaphore\n", urlToCrawl)
+
+	fmt.Println()
+	fmt.Printf("visiting: %v\n", urlToCrawl)
+	normalizedUrl, err := normalizeURL(urlToCrawl)
+	if err != nil {
+		fmt.Printf("failed to normalize %v: %v\n", urlToCrawl, err)
+		return
+	}
+	fmt.Printf("normalized: %v\n", normalizedUrl)
+
+	fmt.Printf("%v - acquiring mutex\n", urlToCrawl)
+	mu.Lock()
+	fmt.Printf("%v - acquired mutex\n", urlToCrawl)
+	if _, exists := pagesVisited[normalizedUrl]; exists {
+		pagesVisited[normalizedUrl] += 1
+		mu.Unlock()
+		return // no need to fetch and crawl again
+	} else {
+		pagesVisited[normalizedUrl] = 1
+	}
+	*pagesCrawled += 1
+	if *pagesCrawled >= MAX_PAGES {
+		mu.Unlock()
+		return
+	}
+	mu.Unlock()
 
 	fmt.Printf("%v: fetching html\n", urlToCrawl)
 	html, err := getHTML(urlToCrawl)
@@ -97,13 +141,16 @@ func crawlPage(base, urlToCrawl string, discoveredUrls chan <-string, sem *semap
 	fmt.Printf("%v: crawl done, found %v urls\n", urlToCrawl, len(discovered))
 	for i, discoveredUrl := range discovered {
 		// Limit crawl to a single domain
-		if strings.Contains(discoveredUrl, base) {
-			fmt.Printf("\t%v: %v - SEND %v\n", i, urlToCrawl, discoveredUrl)
-			discoveredUrls <- discoveredUrl
+		if strings.Contains(discoveredUrl, *base) {
+			wg.Add(1)
+			fmt.Printf("\t%v: %v - %v SPAWN\n", i, urlToCrawl, discoveredUrl)
+			go crawlPage(base, discoveredUrl, pagesVisited, pagesCrawled, MAX_PAGES, mu, sem, sem_ctx, wg)
 		} else {
-			fmt.Printf("\t%v: %v - DISCARD %v\n", i, urlToCrawl, discoveredUrl)
+			fmt.Printf("\t%v: %v - %v DISCARD\n", i, urlToCrawl, discoveredUrl)
 		}
 	}
+
+	fmt.Printf("%v - EXIT\n", urlToCrawl)
 }
 
 func main() {
@@ -120,65 +167,31 @@ func main() {
 		os.Exit(1)
 	}
 
-	normalizedBase, err := normalizeURL(baseURL)
-	if err != nil {
-		fmt.Printf("failed to normalize %v: %v\n", baseURL, err)
-		os.Exit(1)
-	}
+	MAX_PAGES := 20
+	pagesVisited := map[string]int{}
+	pagesCrawled := 0
 
-	// FIXME this could potentially fill up and our crawlers won't be able to send any more
-	// messages, meaning either data will be dropped or the crawler will block and won't
-	// release its semaphore, ensuring program deadlock. Can mitigate this by switching to a
-	// recursive crawl model.
-	discoveredUrls := make(chan string, 8192)
 	var wg sync.WaitGroup
+	var mu sync.Mutex
+	sem := semaphore.NewWeighted(int64(maxConcurrency))
+	sem_ctx := context.TODO()
 	wg.Add(1)
-	availableWorkers := semaphore.NewWeighted(int64(maxConcurrency))
-	ctx := context.TODO()
-	go (func() {
-		pagesVisited := map[string]int{}
-		const MAX_PAGES int = 20
-		pagesCrawled := 0
-		for url := range discoveredUrls {
-			fmt.Println()
-			fmt.Printf("visiting: %v\n", url)
-			normalizedUrl, err := normalizeURL(url)
-			if err != nil {
-				fmt.Printf("failed to normalize %v: %v\n", url, err)
-				continue
-			}
-			fmt.Printf("normalized: %v\n", normalizedUrl)
-			if _, exists := pagesVisited[normalizedUrl]; exists {
-				pagesVisited[normalizedUrl] += 1
-				continue // no need to fetch and crawl again
-			} else {
-				pagesVisited[normalizedUrl] = 1
-			}
+	go crawlPage(
+		&baseURL,
+		baseURL,
+		pagesVisited,
+		&pagesCrawled,
+		MAX_PAGES,
+		&mu,
+		sem,
+		sem_ctx,
+		&wg,
+	)
 
-			pagesCrawled += 1
-			if pagesCrawled >= MAX_PAGES { break }
-
-			fmt.Printf("acquiring goroutine for crawl of %v\n", url)
-			err = availableWorkers.Acquire(ctx, 1)
-			if err != nil {
-				fmt.Printf("failed to acquire goroutine for %v: %v\n", url, err)
-				os.Exit(1)
-			}
-
-			fmt.Printf("ACQUIRED for %v\n", url)
-			go crawlPage(normalizedBase, url, discoveredUrls, availableWorkers)
-		}
-
-		fmt.Println("closing channel")
-		close(discoveredUrls)
-		fmt.Printf("visited %v urls\n", pagesCrawled)
-		for k, v := range pagesVisited {
-			fmt.Printf("\t%v - %v\n", k, v)
-		}
-		wg.Done()
-	})()
-
-	discoveredUrls <- baseURL
 	wg.Wait()
-	fmt.Println("end")
+
+	fmt.Printf("found %v urls\n", pagesCrawled)
+	for k, v := range pagesVisited {
+		fmt.Printf("\t%v - %v\n", k, v)
+	}
 }
