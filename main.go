@@ -80,9 +80,9 @@ func getHTML(rawURL string) (string, error) {
 func crawlPage(
 	base *string,
 	urlToCrawl string,
-	pagesVisited map[string]int,
-	pagesCrawled *int,
-	MAX_PAGES int,
+	urlsFound map[string]int,
+	numPagesCrawled *int,
+	maxPages int,
 	mu *sync.Mutex,
 	sem *semaphore.Weighted,
 	sem_ctx context.Context,
@@ -107,19 +107,19 @@ func crawlPage(
 	}
 	fmt.Printf("normalized: %v\n", normalizedUrl)
 
-	fmt.Printf("%v - acquiring mutex\n", urlToCrawl)
 	mu.Lock()
-	fmt.Printf("%v - acquired mutex\n", urlToCrawl)
-	if _, exists := pagesVisited[normalizedUrl]; exists {
-		pagesVisited[normalizedUrl] += 1
+	if _, exists := urlsFound[normalizedUrl]; exists {
+		urlsFound[normalizedUrl] += 1
 		mu.Unlock()
 		return // no need to fetch and crawl again
+	} 
+
+	urlsFound[normalizedUrl] = 1
+	if *numPagesCrawled < maxPages {
+		*numPagesCrawled += 1
 	} else {
-		pagesVisited[normalizedUrl] = 1
-	}
-	*pagesCrawled += 1
-	if *pagesCrawled >= MAX_PAGES {
 		mu.Unlock()
+		fmt.Printf("%v - page crawl threshold exceeded (%v/%v), aborting\n", urlToCrawl, *numPagesCrawled, maxPages)
 		return
 	}
 	mu.Unlock()
@@ -144,7 +144,7 @@ func crawlPage(
 		if strings.Contains(discoveredUrl, *base) {
 			wg.Add(1)
 			fmt.Printf("\t%v: %v - %v SPAWN\n", i, urlToCrawl, discoveredUrl)
-			go crawlPage(base, discoveredUrl, pagesVisited, pagesCrawled, MAX_PAGES, mu, sem, sem_ctx, wg)
+			go crawlPage(base, discoveredUrl, urlsFound, numPagesCrawled, maxPages, mu, sem, sem_ctx, wg)
 		} else {
 			fmt.Printf("\t%v: %v - %v DISCARD\n", i, urlToCrawl, discoveredUrl)
 		}
@@ -155,8 +155,8 @@ func crawlPage(
 
 func main() {
 	args := os.Args[1:]
-	if len(args) != 2 {
-		fmt.Println("usage: ./crawler URL MAX_CONCURRENCY")
+	if len(args) != 3 {
+		fmt.Println("usage: ./crawler URL MAX_CONCURRENCY MAX_PAGES")
 		os.Exit(1)
 	}
 
@@ -166,11 +166,14 @@ func main() {
 		fmt.Println("MAX_CONCURRENCY must be an integer")
 		os.Exit(1)
 	}
+	maxPages, err := strconv.Atoi(args[2])
+	if err != nil {
+		fmt.Println("MAX_PAGES must be an integer")
+		os.Exit(1)
+	}
 
-	MAX_PAGES := 20
-	pagesVisited := map[string]int{}
-	pagesCrawled := 0
-
+	urlsFound := map[string]int{}
+	numPagesCrawled := 0
 	var wg sync.WaitGroup
 	var mu sync.Mutex
 	sem := semaphore.NewWeighted(int64(maxConcurrency))
@@ -179,9 +182,9 @@ func main() {
 	go crawlPage(
 		&baseURL,
 		baseURL,
-		pagesVisited,
-		&pagesCrawled,
-		MAX_PAGES,
+		urlsFound,
+		&numPagesCrawled,
+		maxPages,
 		&mu,
 		sem,
 		sem_ctx,
@@ -190,8 +193,8 @@ func main() {
 
 	wg.Wait()
 
-	fmt.Printf("found %v urls\n", pagesCrawled)
-	for k, v := range pagesVisited {
+	fmt.Printf("crawled %v pages\n", numPagesCrawled)
+	for k, v := range urlsFound {
 		fmt.Printf("\t%v - %v\n", k, v)
 	}
 }
